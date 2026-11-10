@@ -1,0 +1,104 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: exchange-config
+  namespace: store
+data:
+  SERVICE_NAME: exchange
+  EXCHANGE_CACHE_TTL_SECONDS: "60"
+  AWESOMEAPI_BASE_URL: https://economia.awesomeapi.com.br/json/last
+  OPEN_ER_BASE_URL: https://open.er-api.com/v6/latest
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: exchange
+  namespace: store
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  selector:
+    matchLabels: {app: exchange}
+  template:
+    metadata:
+      labels: {app: exchange}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: /metrics
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      terminationGracePeriodSeconds: 30
+      containers:
+      - name: exchange
+        image: microserv-store/exchange:local
+        imagePullPolicy: IfNotPresent
+        ports: [{containerPort: 8000, name: http}]
+        envFrom: [{configMapRef: {name: exchange-config}}]
+        env:
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef: {name: store-secrets, key: JWT_SECRET}
+        resources:
+          requests: {cpu: 100m, memory: 128Mi}
+          limits: {cpu: "1", memory: 256Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities: {drop: [ALL]}
+        volumeMounts: [{name: tmp, mountPath: /tmp}]
+        startupProbe:
+          httpGet: {path: /health-check, port: http}
+          failureThreshold: 60
+          periodSeconds: 2
+        readinessProbe:
+          httpGet: {path: /ready, port: http}
+          periodSeconds: 5
+        livenessProbe:
+          httpGet: {path: /health-check, port: http}
+          periodSeconds: 10
+      volumes: [{name: tmp, emptyDir: {}}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: exchange
+  namespace: store
+spec:
+  type: ClusterIP
+  selector: {app: exchange}
+  ports: [{port: 8000, targetPort: http, name: http}]
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: exchange
+  namespace: store
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: exchange}
+  minReplicas: 2
+  maxReplicas: 5
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 60
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target: {type: Utilization, averageUtilization: 60}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: exchange
+  namespace: store
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: exchange}
